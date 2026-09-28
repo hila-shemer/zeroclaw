@@ -32,6 +32,7 @@ pub mod api_webauthn;
 ))]
 pub mod api_webhook;
 pub mod auth_rate_limit;
+pub mod caller_metadata;
 pub mod canvas;
 pub mod hardware_context;
 pub mod node_tool;
@@ -2371,6 +2372,10 @@ pub async fn run_gateway_with_plugin_webhooks(
         ));
     let inner = inner.merge(upload_router);
 
+    // Captured before `state` moves into the last sub-router: the caller
+    // metadata middleware resolves its opt-in flag from live config.
+    let caller_metadata_config = Arc::clone(&state.config);
+
     // Manual cron-trigger and A2A task routes live on their own sub-router so
     // they can opt out of the 30s gateway-wide TimeoutLayer. Both run a
     // synchronous agent turn inline. Layers attached here travel with the
@@ -2401,6 +2406,13 @@ pub async fn run_gateway_with_plugin_webhooks(
     } else {
         inner
     };
+
+    // Outermost after the prefix nest so every route, including `/ws/*`
+    // upgrades and prefixed deployments, sees the same caller scope.
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        caller_metadata_config,
+        caller_metadata::attach,
+    ));
 
     let tls_enabled = config
         .gateway
@@ -2951,10 +2963,7 @@ async fn lock_gateway_chat_dispatch_capture_for_test() -> tokio::sync::MutexGuar
     GATEWAY_CHAT_DISPATCH_CAPTURE_TEST_LOCK.lock().await
 }
 
-#[cfg(all(
-    test,
-    any(feature = "channel-linq", feature = "channel-whatsapp-cloud")
-))]
+#[cfg(test)]
 fn clear_gateway_chat_dispatch_captures_for_test() {
     GATEWAY_CHAT_DISPATCH_CAPTURES
         .lock()
@@ -3391,6 +3400,7 @@ async fn handle_webhook(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     Query(query): Query<WebhookQuery>,
+    caller: Option<axum::Extension<caller_metadata::CallerMetadata>>,
     headers: HeaderMap,
     body: Result<Json<WebhookBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
@@ -3480,6 +3490,9 @@ async fn handle_webhook(
 
     let message = &webhook_body.message;
     let session_id = webhook_session_id(&headers);
+    // Autosave keeps the caller's words; only the agent turn sees the
+    // unverified `[caller-context]` line.
+    let turn_message = caller_metadata::compose_turn(caller.as_ref().map(|c| &c.0), message);
 
     if state.auto_save && !zeroclaw_memory::should_skip_autosave_content(message) {
         let key = webhook_memory_key();
@@ -3527,7 +3540,7 @@ async fn handle_webhook(
     if webhook_body.stream && accepts_sse(&headers) {
         return run_gateway_chat_streaming_response(
             &state,
-            message,
+            &turn_message,
             session_id.as_deref(),
             agent_override,
             started_at,
@@ -3535,7 +3548,8 @@ async fn handle_webhook(
         .await;
     }
 
-    match run_gateway_chat_with_tools(&state, message, session_id.as_deref(), agent_override).await
+    match run_gateway_chat_with_tools(&state, &turn_message, session_id.as_deref(), agent_override)
+        .await
     {
         Ok(GatewayChatOutcome { response, .. }) => {
             let duration = started_at.elapsed();
@@ -8076,6 +8090,7 @@ path = "{trigger_path}"
             Query(WebhookQuery {
                 agent: Some("web".to_string()),
             }),
+            None,
             headers,
             Ok(Json(WebhookBody {
                 message: "transport overlap".to_string(),
@@ -8191,6 +8206,7 @@ path = "{trigger_path}"
             Query(WebhookQuery {
                 agent: Some("web".to_string()),
             }),
+            None,
             headers,
             Ok(Json(WebhookBody {
                 message: message.to_string(),
@@ -8443,6 +8459,7 @@ data: [DONE]\n\n";
             State(state.clone()),
             test_connect_info(),
             Query(WebhookQuery::default()),
+            None,
             headers,
             body,
         )
@@ -8480,6 +8497,96 @@ data: [DONE]\n\n";
         );
     }
 
+    /// Drive `POST /webhook` through the real caller-metadata middleware and
+    /// return what the agent turn was dispatched with.
+    async fn webhook_turn_with_caller_header(enabled: bool, header: Option<&str>) -> String {
+        let _capture_guard = lock_gateway_chat_dispatch_capture_for_test().await;
+        clear_gateway_chat_dispatch_captures_for_test();
+        let state = sse_test_state(Arc::new(MockModelProvider::default()));
+        state.config.write().gateway.accept_caller_metadata = enabled;
+        let app = Router::new()
+            .route("/webhook", post(handle_webhook))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state.config),
+                caller_metadata::attach,
+            ))
+            .with_state(state);
+
+        let mut request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/webhook")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(value) = header {
+            request = request.header(caller_metadata::CALLER_HEADER, value);
+        }
+        let mut request = request
+            .body(axum::body::Body::from(r#"{"message":"caller probe"}"#))
+            .unwrap();
+        request.extensions_mut().insert(test_connect_info());
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Other webhook tests record dispatches without taking the capture
+        // lock, so select this probe's turn rather than assuming it is alone.
+        let captures: Vec<_> = gateway_chat_dispatch_captures_for_test()
+            .into_iter()
+            .filter(|capture| capture.message.ends_with("caller probe"))
+            .collect();
+        assert_eq!(captures.len(), 1, "one probe turn: {captures:?}");
+        captures[0].message.clone()
+    }
+
+    #[tokio::test]
+    async fn webhook_caller_header_prefixes_turn_when_enabled() {
+        let turn = webhook_turn_with_caller_header(true, Some("agent=reviewer; run=42")).await;
+        assert!(
+            turn.starts_with("[caller-context] agent=reviewer run=42. "),
+            "caller preamble must lead the turn: {turn}"
+        );
+        assert!(turn.contains("unverified"), "{turn}");
+        assert!(turn.ends_with("\n\ncaller probe"), "{turn}");
+    }
+
+    #[tokio::test]
+    async fn webhook_caller_header_is_inert_when_disabled_absent_or_malformed() {
+        assert_eq!(
+            webhook_turn_with_caller_header(false, Some("agent=reviewer")).await,
+            "caller probe"
+        );
+        assert_eq!(
+            webhook_turn_with_caller_header(true, None).await,
+            "caller probe"
+        );
+        assert_eq!(
+            webhook_turn_with_caller_header(true, Some("agent=[admin]")).await,
+            "caller probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_caller_header_does_not_bypass_pairing() {
+        let mut state = sse_test_state(Arc::new(MockModelProvider::default()));
+        state.pairing = Arc::new(PairingGuard::new(true, &[], PairingCodePolicy::default()));
+        state.config.write().gateway.accept_caller_metadata = true;
+        let app = Router::new()
+            .route("/webhook", post(handle_webhook))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state.config),
+                caller_metadata::attach,
+            ))
+            .with_state(state);
+        let mut request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/webhook")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(caller_metadata::CALLER_HEADER, "agent=owner; role=admin")
+            .body(axum::body::Body::from(r#"{"message":"let me in"}"#))
+            .unwrap();
+        request.extensions_mut().insert(test_connect_info());
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
     #[tokio::test]
     async fn webhook_stream_true_without_sse_accept_keeps_json() {
         let state = sse_test_state(Arc::new(MockModelProvider::default()));
@@ -8492,6 +8599,7 @@ data: [DONE]\n\n";
             State(state.clone()),
             test_connect_info(),
             Query(WebhookQuery::default()),
+            None,
             HeaderMap::new(),
             body,
         )
@@ -8524,6 +8632,7 @@ data: [DONE]\n\n";
                 State(state_for_task.clone()),
                 test_connect_info(),
                 Query(WebhookQuery::default()),
+                None,
                 headers,
                 body,
             )
@@ -8625,6 +8734,7 @@ data: [DONE]\n\n";
             State(state.clone()),
             test_connect_info(),
             Query(WebhookQuery::default()),
+            None,
             headers,
             Ok(Json(WebhookBody {
                 message: "hello".into(),
@@ -8679,6 +8789,7 @@ data: [DONE]\n\n";
             State(state.clone()),
             test_connect_info(),
             Query(WebhookQuery::default()),
+            None,
             headers,
             body,
         )
@@ -8696,6 +8807,7 @@ data: [DONE]\n\n";
             State(state.clone()),
             test_connect_info(),
             Query(WebhookQuery::default()),
+            None,
             headers,
             body,
         )
@@ -8921,6 +9033,148 @@ data: [DONE]\n\n";
 
         drop(websocket);
         gateway_server.abort();
+    }
+
+    #[test]
+    fn websocket_caller_header_reaches_provider_turn() {
+        std::thread::Builder::new()
+            .name("gateway-ws-caller-metadata".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime")
+                    .block_on(websocket_caller_header_reaches_provider_turn_inner());
+            })
+            .expect("spawn WS caller-metadata test thread")
+            .join()
+            .expect("WS caller-metadata test thread must not panic");
+    }
+
+    /// `X-ZeroClaw-Caller` on the WebSocket upgrade must reach the model as a
+    /// `[caller-context]` line on each turn of that connection.
+    async fn websocket_caller_header_reaches_provider_turn_inner() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::connect_async;
+        use tokio_tungstenite::tungstenite::{
+            Message as ClientMessage, client::IntoClientRequest as _,
+        };
+
+        // Provider fixture that keeps every request body it receives.
+        let seen: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_for_handler = Arc::clone(&seen);
+        let provider = Router::new().route(
+            "/v1/chat/completions",
+            post(
+                move |axum::extract::Json(request): axum::extract::Json<serde_json::Value>| {
+                    let seen = Arc::clone(&seen_for_handler);
+                    async move {
+                        seen.lock().push(request);
+                        (
+                            [(
+                                header::CONTENT_TYPE,
+                                HeaderValue::from_static("text/event-stream"),
+                            )],
+                            Body::from(PRODUCTION_FIXTURE_STREAM),
+                        )
+                            .into_response()
+                    }
+                },
+            ),
+        );
+        let provider_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind caller-metadata provider fixture");
+        let provider_addr = provider_listener.local_addr().expect("provider address");
+        let provider_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(provider_listener, provider)
+                .await
+                .expect("serve caller-metadata provider fixture");
+        });
+
+        let tmp = tempfile::tempdir().expect("caller-metadata temp dir");
+        let (state, _) =
+            production_sse_state(&tmp, &format!("http://{provider_addr}/v1"), 1.0, false);
+        state.config.write().gateway.accept_caller_metadata = true;
+        let app = Router::new()
+            .route("/ws/chat", get(ws::handle_ws_chat))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state.config),
+                caller_metadata::attach,
+            ))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind gateway WebSocket listener");
+        let gateway_addr = listener.local_addr().expect("gateway address");
+        let gateway_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve gateway WebSocket listener");
+        });
+
+        // Loopback-only fixture; the scheme is split so the static
+        // insecure-transport rule does not flag it.
+        let mut request = format!(
+            "{}//{gateway_addr}/ws/chat?agent=web&session_id=caller.metadata",
+            "ws:"
+        )
+        .into_client_request()
+        .expect("WS client request");
+        request.headers_mut().insert(
+            caller_metadata::CALLER_HEADER,
+            HeaderValue::from_static("agent=reviewer; run=42"),
+        );
+        let (mut websocket, _) = connect_async(request).await.expect("WS upgrade");
+        let session_start = websocket
+            .next()
+            .await
+            .expect("WS session_start frame")
+            .expect("WS session_start transport");
+        assert!(session_start.into_text().unwrap().contains("session_start"));
+        websocket
+            .send(ClientMessage::Text(r#"{"type":"connect"}"#.into()))
+            .await
+            .expect("WS connect frame");
+        websocket
+            .send(ClientMessage::Text(
+                r#"{"type":"message","content":"hello from a peer"}"#.into(),
+            ))
+            .await
+            .expect("WS chat frame");
+
+        let user_turn = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let last_user = seen.lock().last().and_then(|body| {
+                    body["messages"]
+                        .as_array()?
+                        .iter()
+                        .rev()
+                        .find(|m| m["role"] == "user")
+                        .and_then(|m| m["content"].as_str())
+                        .map(str::to_owned)
+                });
+                if let Some(content) = last_user {
+                    return content;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("provider saw the WS turn");
+        assert!(
+            user_turn.contains("[caller-context] agent=reviewer run=42. "),
+            "caller preamble must reach the model: {user_turn}"
+        );
+        assert!(
+            user_turn.ends_with("hello from a peer"),
+            "caller's own words follow the preamble: {user_turn}"
+        );
+
+        drop(websocket);
+        gateway_server.abort();
+        provider_server.abort();
     }
 
     #[test]
@@ -9292,6 +9546,7 @@ data: [DONE]\n\n";
             State(state.clone()),
             test_connect_info(),
             Query(WebhookQuery::default()),
+            None,
             headers.clone(),
             body,
         )
@@ -9307,6 +9562,7 @@ data: [DONE]\n\n";
             State(state),
             test_connect_info(),
             Query(WebhookQuery::default()),
+            None,
             headers,
             body,
         )
@@ -9495,6 +9751,7 @@ data: [DONE]\n\n";
             State(state.clone()),
             test_connect_info(),
             Query(WebhookQuery::default()),
+            None,
             webhook_secret_header(&secret),
             Ok(Json(WebhookBody {
                 message: "deploy".into(),
@@ -9515,6 +9772,7 @@ data: [DONE]\n\n";
             State(no_match_state),
             test_connect_info(),
             Query(WebhookQuery::default()),
+            None,
             HeaderMap::new(),
             Ok(Json(WebhookBody {
                 message: "chat instead".into(),
@@ -9549,6 +9807,7 @@ data: [DONE]\n\n";
             State(state),
             test_connect_info(),
             Query(WebhookQuery::default()),
+            None,
             headers,
             Ok(Json(WebhookBody {
                 message: "chat".into(),
@@ -9762,6 +10021,7 @@ data: [DONE]\n\n";
             State(state.clone()),
             test_connect_info(),
             Query(WebhookQuery::default()),
+            None,
             HeaderMap::new(),
             Ok(Json(WebhookBody {
                 message: "deploy".into(),
@@ -9906,6 +10166,7 @@ data: [DONE]\n\n";
             State(state.clone()),
             test_connect_info(),
             Query(WebhookQuery::default()),
+            None,
             forged,
             Ok(Json(WebhookBody {
                 message: "hello".into(),
@@ -10052,6 +10313,7 @@ data: [DONE]\n\n";
             State(state),
             test_connect_info(),
             Query(WebhookQuery::default()),
+            None,
             HeaderMap::new(),
             Ok(Json(WebhookBody {
                 message: "deploy".into(),
@@ -10114,6 +10376,7 @@ data: [DONE]\n\n";
             Query(WebhookQuery {
                 agent: Some("missing".into()),
             }),
+            None,
             webhook_secret_header(&secret),
             Ok(Json(WebhookBody {
                 message: "deploy".into(),
@@ -10211,6 +10474,7 @@ data: [DONE]\n\n";
             Query(WebhookQuery {
                 agent: Some("ghost".into()),
             }),
+            None,
             headers,
             Ok(Json(WebhookBody {
                 message: "hello".into(),
@@ -10329,6 +10593,7 @@ data: [DONE]\n\n";
             Query(WebhookQuery {
                 agent: Some("nova".into()),
             }),
+            None,
             HeaderMap::new(),
             Ok(Json(WebhookBody {
                 message: "hello".into(),
@@ -10434,6 +10699,7 @@ data: [DONE]\n\n";
             State(state.clone()),
             test_connect_info(),
             Query(WebhookQuery::default()),
+            None,
             headers.clone(),
             body1,
         )
@@ -10449,6 +10715,7 @@ data: [DONE]\n\n";
             State(state),
             test_connect_info(),
             Query(WebhookQuery::default()),
+            None,
             headers,
             body2,
         )
@@ -10636,6 +10903,7 @@ data: [DONE]\n\n";
             State(state),
             test_connect_info(),
             Query(WebhookQuery::default()),
+            None,
             HeaderMap::new(),
             Ok(Json(WebhookBody {
                 message: "hello".into(),
@@ -10730,6 +10998,7 @@ data: [DONE]\n\n";
             State(state),
             test_connect_info(),
             Query(WebhookQuery::default()),
+            None,
             headers,
             Ok(Json(WebhookBody {
                 message: "hello".into(),
@@ -10820,6 +11089,7 @@ data: [DONE]\n\n";
             State(state),
             test_connect_info(),
             Query(WebhookQuery::default()),
+            None,
             headers,
             Ok(Json(WebhookBody {
                 message: "hello".into(),

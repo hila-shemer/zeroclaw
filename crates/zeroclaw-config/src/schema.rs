@@ -7706,6 +7706,16 @@ pub struct GatewayConfig {
     #[credential_class = "public_value"]
     pub trust_forwarded_headers: bool,
 
+    /// Accept the `X-ZeroClaw-Caller` request header, which lets a calling
+    /// agent or tool describe itself (`agent=<name>; run=<id>; ...`). When
+    /// enabled, a well-formed header is attached to the request's log scope
+    /// on every route and prepended to `/webhook` and `/ws/chat` turns as an
+    /// explicitly unverified `[caller-context]` line. The header never
+    /// authenticates or authorizes anything: pairing tokens and webhook
+    /// secrets remain the only credentials. (default: false)
+    #[serde(default)]
+    pub accept_caller_metadata: bool,
+
     /// Optional URL path prefix for reverse-proxy deployments.
     /// When set, all gateway routes are served under this prefix.
     /// Must start with `/` and must not end with `/`.
@@ -7860,6 +7870,7 @@ impl Default for GatewayConfig {
             webhook_rate_limit_per_minute: default_webhook_rate_limit(),
             webhook_secret: None,
             trust_forwarded_headers: false,
+            accept_caller_metadata: false,
             path_prefix: None,
             rate_limit_max_keys: default_gateway_rate_limit_max_keys(),
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
@@ -34982,6 +34993,7 @@ allowed_numbers = ["+1", "+2"]
             webhook_rate_limit_per_minute: 80,
             webhook_secret: None,
             trust_forwarded_headers: true,
+            accept_caller_metadata: true,
             path_prefix: Some("/zeroclaw".into()),
             rate_limit_max_keys: 2048,
             idempotency_ttl_secs: 600,

@@ -8,6 +8,7 @@ use super::{
     AppState, GW_SESSION_PREFIX, gateway_cancel_key, register_cancel_token,
     remove_cancel_token_if_current,
 };
+use crate::caller_metadata::CallerMetadata;
 use crate::ws_approval::{PendingApprovals, WsApprovalChannel, new_pending_approvals};
 use axum::{
     extract::{
@@ -126,6 +127,7 @@ fn extract_ws_token<'a>(headers: &'a HeaderMap, query_token: Option<&'a str>) ->
 pub async fn handle_ws_chat(
     State(state): State<AppState>,
     Query(params): Query<WsQuery>,
+    caller: Option<axum::Extension<CallerMetadata>>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
@@ -186,7 +188,15 @@ pub async fn handle_ws_chat(
     let session_id = params.session_id;
     let session_name = params.name;
     let session_cwd = params.cwd.or(params.workspace_dir);
+    // The upgraded socket runs outside the request future, so it re-enters
+    // the caller's log scope itself; `Span::none()` is a no-op when the
+    // connection carried no accepted caller metadata.
+    let caller = caller.map(|axum::Extension(caller)| caller);
+    let caller_span = caller
+        .as_ref()
+        .map_or_else(::zeroclaw_log::Span::none, CallerMetadata::log_span);
     ws.on_upgrade(move |socket| {
+        use ::zeroclaw_log::Instrument as _;
         handle_socket(
             socket,
             state,
@@ -195,7 +205,9 @@ pub async fn handle_ws_chat(
             session_name,
             session_cwd,
             auth_subject,
+            caller,
         )
+        .instrument(caller_span)
     })
     .into_response()
 }
@@ -381,6 +393,9 @@ async fn handle_socket(
     // connection was authenticated. Threaded to SOP approval frames so a policied
     // gate can be satisfied by an identified WS caller.
     auth_subject: Option<String>,
+    // Self-described, unverified caller from `X-ZeroClaw-Caller` on the
+    // upgrade request; prefixed to every turn on this connection.
+    caller: Option<CallerMetadata>,
 ) {
     let (mut sender, mut receiver) = socket.split();
 
@@ -707,6 +722,7 @@ async fn handle_socket(
                         &session_key,
                         &session_id,
                         auth_subject.as_deref(),
+                        caller.as_ref(),
                     )
                     .await;
                     if client_gone {
@@ -883,6 +899,7 @@ async fn handle_socket(
                     &session_key,
                     &session_id,
                     auth_subject.as_deref(),
+                    caller.as_ref(),
                 )
                 .await;
                 if client_gone {
@@ -1647,6 +1664,7 @@ async fn process_chat_message(
     // Transport-authenticated approval subject (paired-token hash), threaded so a
     // mid-turn SOP approval frame carries the same identity as the top-level path.
     auth_subject: Option<&str>,
+    caller: Option<&CallerMetadata>,
 ) -> bool {
     use futures_util::StreamExt as _;
     use zeroclaw_runtime::agent::TurnEvent;
@@ -1728,7 +1746,9 @@ async fn process_chat_message(
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
     let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel::<String>(32);
 
-    let content_owned = content.to_string();
+    // Only the agent turn sees the `[caller-context]` line; memory
+    // consolidation below keeps the caller's own words.
+    let content_owned = crate::caller_metadata::compose_turn(caller, content);
     let session_key_owned = session_key.to_string();
     // The shared Agent turn boundary owns safeguard attribution and returns it
     // alongside the undecorated transcript. This transport only renders the

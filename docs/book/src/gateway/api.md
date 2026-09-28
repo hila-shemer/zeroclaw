@@ -23,6 +23,40 @@ Local-bound by default. Over-the-network access requires TLS termination at
 the gateway or in front of it; the per-property and PATCH endpoints are not
 safe to expose unauthenticated regardless of TLS posture.
 
+## Caller metadata header
+
+An agent or tool calling the gateway can describe itself with one
+`X-ZeroClaw-Caller` request header, so the receiving agent and the logs can
+tell callers apart:
+
+```text
+X-ZeroClaw-Caller: agent=reviewer; run=42; host=build-01
+```
+
+The header is off unless `gateway.accept_caller_metadata = true`. The flag is
+read from live config on every request. When it is on and the header parses:
+
+- every log event the request produces carries a `caller` attribute
+  (`agent=reviewer run=42 host=build-01`), on every route;
+- `POST /webhook` turns (JSON and SSE) and every turn on a `/ws/chat`
+  connection opened with the header start with an extra line:
+  `[caller-context] agent=reviewer run=42 host=build-01.` It is followed by a
+  note telling the model the pairs are self-asserted and unverified. Webhook
+  autosave and WebSocket memory consolidation keep the caller's own words
+  without the line.
+
+The grammar is narrow. It allows up to 8 `key=value` pairs separated by `;`
+and 512 bytes in all. Keys are 1–32 bytes of lowercase letters, digits, `_`,
+`-` and `.`, and must be unique. Values are 1–128 bytes of letters, digits
+and `_ - . : / @ +`. A header that breaks any rule is ignored as a whole
+and logged with a reason. The request itself proceeds unchanged.
+
+The header is not a credential. It never authenticates or authorizes a
+request: pairing tokens and `X-Webhook-Secret` remain the only gateway
+credentials, and an unauthenticated request carrying the header is rejected
+exactly as before. Browsers cannot set custom headers on a WebSocket upgrade,
+so on `/ws/chat` the header comes only from non-browser clients.
+
 ## Channel-plugin webhook ingress
 
 Builds with WASM plugin support expose `GET` and `POST /plugin/{path}` when a running,
